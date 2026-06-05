@@ -4,6 +4,7 @@ import io
 import os
 import socket
 import argparse
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -17,10 +18,16 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 SHARE_DIR = Path(os.environ.get("LAN_SHARE_DIR", "shared")).resolve()
 SHARE_DIR.mkdir(parents=True, exist_ok=True)
+
+# 共享文本消息(内存存储,服务重启后清空)
+MAX_MESSAGES = 200
+_messages = []
+_messages_lock = threading.Lock()
+_msg_seq = 0
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None  # 不限制单次上传大小
@@ -95,6 +102,28 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .row .del { color: #ef4444; }
   .row .del:hover { background: #fef2f2; }
   .empty { padding: 40px; text-align: center; color: #9ca3af; font-size: 14px; }
+  h2 { font-size: 15px; margin: 24px 0 10px; color: #374151; }
+  .composer { background: #fff; border-radius: 12px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .composer textarea { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px;
+         padding: 10px; font-size: 14px; resize: vertical; min-height: 64px;
+         font-family: inherit; }
+  .composer textarea:focus { outline: none; border-color: #3b82f6; }
+  .composer .send { margin-top: 8px; float: right; background: #3b82f6; color: #fff;
+         border: none; border-radius: 8px; padding: 8px 20px; font-size: 14px; cursor: pointer; }
+  .composer .send:hover { background: #2563eb; }
+  .composer::after { content: ""; display: block; clear: both; }
+  .msgs { margin-top: 12px; }
+  .msg { background: #fff; border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
+         box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .msg .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .msg .from { font-size: 12px; color: #9ca3af; flex: 1; }
+  .msg .text { font-size: 14px; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
+  .msg button { font-size: 12px; border: none; background: none; cursor: pointer;
+         padding: 3px 8px; border-radius: 6px; }
+  .msg .copy { color: #3b82f6; }
+  .msg .copy:hover { background: #eff6ff; }
+  .msg .delm { color: #ef4444; }
+  .msg .delm:hover { background: #fef2f2; }
 </style>
 </head>
 <body>
@@ -107,6 +136,13 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   <input type="file" id="picker" multiple hidden>
   <div id="bars"></div>
   <div class="list" id="list"><div class="empty">加载中…</div></div>
+
+  <h2>📋 文本互传</h2>
+  <div class="composer">
+    <textarea id="msgInput" placeholder="输入要分享的文本、链接、验证码…&#10;Ctrl+Enter 发送"></textarea>
+    <button class="send" id="msgSend">发送</button>
+  </div>
+  <div class="msgs" id="msgs"></div>
 </div>
 <script>
 const drop = document.getElementById('drop');
@@ -172,8 +208,80 @@ function escapeHtml(s) {
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// ---- 文本互传 ----
+const msgInput = document.getElementById('msgInput');
+const msgSend = document.getElementById('msgSend');
+const msgs = document.getElementById('msgs');
+
+msgSend.onclick = sendMessage;
+msgInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMessage(); }
+});
+
+async function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text) return;
+  msgSend.disabled = true;
+  try {
+    const res = await fetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+    if (res.ok) { msgInput.value = ''; loadMessages(); }
+    else { const e = await res.json(); alert(e.error || '发送失败'); }
+  } finally { msgSend.disabled = false; }
+}
+
+async function loadMessages() {
+  const res = await fetch('/api/messages');
+  const items = await res.json();
+  if (!items.length) { msgs.innerHTML = ''; return; }
+  msgs.innerHTML = items.map(m => `
+    <div class="msg">
+      <div class="head">
+        <span class="from">${escapeHtml(m.ip)} · ${m.time}</span>
+        <button class="copy" data-id="${m.id}">复制</button>
+        <button class="delm" data-id="${m.id}">删除</button>
+      </div>
+      <div class="text" id="msgtext-${m.id}">${escapeHtml(m.text)}</div>
+    </div>`).join('');
+}
+
+msgs.addEventListener('click', e => {
+  const id = e.target.dataset.id;
+  if (!id) return;
+  if (e.target.classList.contains('copy')) copyMessage(id, e.target);
+  else if (e.target.classList.contains('delm')) deleteMessage(id);
+});
+
+async function copyMessage(id, btn) {
+  const text = document.getElementById('msgtext-' + id).textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    const old = btn.textContent; btn.textContent = '已复制';
+    setTimeout(() => btn.textContent = old, 1200);
+  } catch {
+    // 非 HTTPS 下 clipboard API 不可用,降级用选区复制
+    const r = document.createRange();
+    r.selectNode(document.getElementById('msgtext-' + id));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    try { document.execCommand('copy'); } catch {}
+    sel.removeAllRanges();
+    const old = btn.textContent; btn.textContent = '已复制';
+    setTimeout(() => btn.textContent = old, 1200);
+  }
+}
+
+async function deleteMessage(id) {
+  await fetch('/api/messages/' + id, { method: 'DELETE' });
+  loadMessages();
+}
+
 loadFiles();
+loadMessages();
 setInterval(loadFiles, 4000);
+setInterval(loadMessages, 4000);
 </script>
 </body>
 </html>
@@ -235,6 +343,45 @@ def delete(filename):
         abort(404)
     target.unlink()
     return jsonify({"deleted": target.name})
+
+
+@app.route("/api/messages")
+def list_messages():
+    with _messages_lock:
+        return jsonify(list(_messages))
+
+
+@app.route("/api/messages", methods=["POST"])
+def post_message():
+    global _msg_seq
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "内容为空"}), 400
+    if len(text) > 10000:
+        return jsonify({"error": "内容过长(上限 10000 字符)"}), 400
+    with _messages_lock:
+        _msg_seq += 1
+        msg = {
+            "id": _msg_seq,
+            "text": text,
+            "ip": request.remote_addr or "?",
+            "time": datetime.now().strftime("%H:%M:%S"),
+        }
+        _messages.insert(0, msg)
+        del _messages[MAX_MESSAGES:]
+    return jsonify(msg)
+
+
+@app.route("/api/messages/<int:msg_id>", methods=["DELETE"])
+def delete_message(msg_id):
+    with _messages_lock:
+        before = len(_messages)
+        _messages[:] = [m for m in _messages if m["id"] != msg_id]
+        deleted = before != len(_messages)
+    if not deleted:
+        abort(404)
+    return jsonify({"deleted": msg_id})
 
 
 def get_lan_ip() -> str:
