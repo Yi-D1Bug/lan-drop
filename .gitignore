@@ -1,0 +1,27 @@
+# 用户上传的共享文件,不进仓库
+shared/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 日志
+*.log
+
+# 打包产物
+*.spec
+
+# 编辑器/系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
