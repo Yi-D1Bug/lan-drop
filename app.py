@@ -2,9 +2,11 @@
 """局域网文件传输工具 — 启动后局域网内任意设备用浏览器访问即可上传/下载文件。"""
 import io
 import os
+import re
 import socket
 import argparse
 import threading
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -16,9 +18,8 @@ from flask import (
     abort,
     render_template_string,
 )
-from werkzeug.utils import secure_filename
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 SHARE_DIR = Path(os.environ.get("LAN_SHARE_DIR", "shared")).resolve()
 SHARE_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,9 +34,37 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None  # 不限制单次上传大小
 
 
+# Windows 保留设备名,避免生成无法访问的文件
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+# 文件名中需要剔除的字符:路径分隔符、控制字符及各系统非法字符
+_BAD_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+
+
+def sanitize_filename(filename: str) -> str:
+    """清洗用户提供的文件名:保留中文等 Unicode,去掉路径分隔符与非法字符。
+
+    werkzeug 的 secure_filename 会丢弃所有非 ASCII 字符(中文名会变成只剩扩展名),
+    因此这里改用自定义清洗,既保留可读名又防止路径穿越。
+    """
+    # 只取最后一段,丢弃任何目录部分(防穿越)
+    name = filename.replace("\\", "/").split("/")[-1]
+    name = unicodedata.normalize("NFC", name)
+    name = _BAD_CHARS.sub("", name)
+    name = name.strip().strip(".")  # 去掉首尾空格和点(Windows 不允许结尾点/空格)
+    if name in (".", ".."):
+        return ""
+    if name.split(".")[0].upper() in _WIN_RESERVED:
+        name = "_" + name
+    return name[:255]  # 多数文件系统单段上限 255 字节,简单按字符截断
+
+
 def safe_target(filename: str) -> Path:
     """把用户提供的文件名解析成 SHARE_DIR 内的安全路径,阻止路径穿越。"""
-    name = secure_filename(filename)
+    name = sanitize_filename(filename)
     if not name:
         abort(400, "非法文件名")
     target = (SHARE_DIR / name).resolve()
