@@ -560,7 +560,7 @@ def print_banner(ip: str, port: int):
 
 def main():
     parser = argparse.ArgumentParser(description="局域网文件传输工具")
-    parser.add_argument("--port", type=int, default=8000, help="监听端口 (默认 8000)")
+    parser.add_argument("--port", type=int, default=9000, help="监听端口 (默认 9000)")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
     args = parser.parse_args()
 
