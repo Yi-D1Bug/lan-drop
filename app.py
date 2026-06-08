@@ -23,7 +23,7 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.2.0"
+__version__ = "1.2.2"
 
 SHARE_DIR = Path(os.environ.get("LAN_SHARE_DIR", "shared")).resolve()
 SHARE_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,6 +35,7 @@ _messages_lock = threading.Lock()
 _msg_seq = 0
 
 # SSE 客户端管理
+MAX_SSE_CLIENTS = 50  # 同时在线连接上限,防止恶意/狂刷累积常驻线程
 _sse_clients = []
 _sse_clients_lock = threading.Lock()
 
@@ -51,6 +52,13 @@ def _broadcast(event: str, data: dict):
                 dead.append(q)
         for q in dead:
             _sse_clients.remove(q)
+
+
+def _broadcast_presence():
+    """广播当前在线人数(以 SSE 连接数为准)。"""
+    with _sse_clients_lock:
+        count = len(_sse_clients)
+    _broadcast("presence", {"count": count})
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None  # 不限制单次上传大小
@@ -154,6 +162,8 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .row .del:hover { background: #fef2f2; }
   .empty { padding: 40px; text-align: center; color: #9ca3af; font-size: 14px; }
   h2 { font-size: 15px; margin: 24px 0 10px; color: #374151; }
+  .online { font-size: 12px; font-weight: normal; color: #10b981; margin-left: 6px; }
+  .online.off { color: #9ca3af; }
   .nick-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; color: #6b7280; }
   .nick-bar input { border: 1px solid #e5e7eb; border-radius: 6px; padding: 4px 8px;
          font-size: 13px; width: 100px; font-family: inherit; }
@@ -200,7 +210,7 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   <div id="bars"></div>
   <div class="list" id="list"><div class="empty">加载中…</div></div>
 
-  <h2>💬 聊天室</h2>
+  <h2>💬 聊天室 <span id="online" class="online">● 在线 1</span></h2>
   <div class="nick-bar">
     <span>昵称:</span>
     <input type="text" id="nickInput" maxlength="16" spellcheck="false">
@@ -338,6 +348,7 @@ async function loadMessages() {
 }
 
 function appendMsg(m) {
+  if (document.getElementById('msg-' + m.id)) return;  // 去重:避免极端时序下重复渲染
   chatBox.insertAdjacentHTML('beforeend', renderMsg(m));
   chatBox.scrollTop = chatBox.scrollHeight;
 }
@@ -379,12 +390,24 @@ function stopPolling() {
   if (msgPollTimer) { clearInterval(msgPollTimer); msgPollTimer = null; }
 }
 
+const onlineEl = document.getElementById('online');
+function setOnline(count, connected) {
+  if (connected) {
+    onlineEl.textContent = '● 在线 ' + count;
+    onlineEl.classList.remove('off');
+  } else {
+    onlineEl.textContent = '○ 已断开';
+    onlineEl.classList.add('off');
+  }
+}
+
 function connectSSE() {
   const es = new EventSource('/api/messages/stream');
   es.addEventListener('message', e => { try { appendMsg(JSON.parse(e.data)); } catch {} });
   es.addEventListener('delete', e => { try { removeMsg(JSON.parse(e.data).id); } catch {} });
+  es.addEventListener('presence', e => { try { setOnline(JSON.parse(e.data).count, true); } catch {} });
   es.onopen = () => stopPolling();
-  es.onerror = () => { es.close(); startPolling(); setTimeout(connectSSE, 5000); };
+  es.onerror = () => { es.close(); setOnline(0, false); startPolling(); setTimeout(connectSSE, 5000); };
 }
 
 loadFiles();
@@ -501,7 +524,13 @@ def delete_message(msg_id):
 def message_stream():
     q = queue.Queue(maxsize=64)
     with _sse_clients_lock:
+        if len(_sse_clients) >= MAX_SSE_CLIENTS:
+            abort(503, "在线连接数已达上限")
         _sse_clients.append(q)
+        count = len(_sse_clients)
+    # 给本连接立即推一次当前人数,并通知其他人有新成员加入
+    q.put_nowait(f"event: presence\ndata: {json.dumps({'count': count})}\n\n")
+    _broadcast_presence()
 
     @stream_with_context
     def generate():
@@ -518,6 +547,7 @@ def message_stream():
             with _sse_clients_lock:
                 if q in _sse_clients:
                     _sse_clients.remove(q)
+            _broadcast_presence()
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
