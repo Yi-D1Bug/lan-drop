@@ -4,15 +4,18 @@ import io
 import json
 import os
 import re
+import sys
 import time
 import queue
 import socket
+import platform
 import argparse
 import threading
 import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from flask import (
     Flask,
@@ -25,10 +28,18 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
-SHARE_DIR = Path(os.environ.get("LAN_SHARE_DIR", "shared")).resolve()
-SHARE_DIR.mkdir(parents=True, exist_ok=True)
+# 配置文件目录(平台相关,不依赖 SHARE_DIR)
+if platform.system() == "Windows":
+    _CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "lan-drop"
+else:
+    _CONFIG_DIR = Path.home() / ".config" / "lan-drop"
+_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+_CONFIG_FILE = _CONFIG_DIR / "config.json"
+
+# 共享目录 — 在 main() 中根据 config/CLI/环境变量动态设置
+SHARE_DIR: Optional[Path] = None
 
 # 共享文本消息(内存存储,服务重启后清空)
 MAX_MESSAGES = 200
@@ -100,8 +111,88 @@ _upload_limiter = RateLimiter(30, 60)   # 上传: 30 次 / 分钟
 _delete_limiter = RateLimiter(20, 60)   # 删除: 20 次 / 分钟
 
 
+# ---- 配置管理 ----
+def _load_config() -> dict:
+    """加载配置文件,不存在则返回默认值。"""
+    default = {
+        "autostart": False,
+        "share_dir": str(Path("shared").resolve()),
+        "port": 9000,
+        "host": "0.0.0.0",
+    }
+    if _CONFIG_FILE.is_file():
+        try:
+            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                return {**default, **{k: v for k, v in saved.items() if k in default}}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return dict(default)
+
+
+def _save_config(cfg: dict):
+    """保存配置到文件。"""
+    try:
+        with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+# ---- 开机自启 ----
+def _get_startup_dir() -> Optional[Path]:
+    """返回操作系统的自启目录路径。"""
+    if platform.system() == "Windows":
+        p = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        return p if p.parent.parent.parent.exists() else None
+    # Linux
+    d = Path.home() / ".config" / "autostart"
+    return d
+
+
+def _get_autostart_path() -> Optional[Path]:
+    """返回自启入口文件路径(Windows 为 .vbs, Linux 为 .desktop)。"""
+    d = _get_startup_dir()
+    if d is None:
+        return None
+    if platform.system() == "Windows":
+        return d / "lan-drop.vbs"
+    return d / "lan-drop.desktop"
+
+
+def _check_autostart() -> bool:
+    """检查自启文件是否实际存在(可能跟配置不一致)。"""
+    p = _get_autostart_path()
+    return p.is_file() if p else False
+
+
+def _apply_autostart(enable: bool):
+    """创建或删除开机自启入口。"""
+    path = _get_autostart_path()
+    if path is None:
+        return
+    if enable:
+        dir_ = path.parent
+        dir_.mkdir(parents=True, exist_ok=True)
+        if getattr(sys, "frozen", False):
+            # PyInstaller 打包的 exe
+            vbs = f'CreateObject("Wscript.Shell").Run """{sys.executable}""", 0, False'
+        else:
+            # Python 脚本 — 用 pythonw.exe 无窗口启动
+            pythonw = str(Path(sys.executable).parent / "pythonw.exe")
+            script = os.path.abspath(sys.argv[0])
+            vbs = f'CreateObject("Wscript.Shell").Run """{pythonw}"" ""{script}""", 0, False'
+        with open(path, "w") as f:
+            f.write(vbs)
+    else:
+        if path.exists():
+            path.unlink()
+
+
 # ---- 消息持久化 ----
-CHAT_FILE = SHARE_DIR / ".chat.json"
+# CHAT_FILE / LOG_FILE 在 main() 中根据最终 SHARE_DIR 设置
+CHAT_FILE: Optional[Path] = None
 
 
 def _save_messages():
@@ -133,7 +224,7 @@ def _load_messages():
 
 
 # ---- 操作日志 ----
-LOG_FILE = SHARE_DIR / ".lan-drop.log"
+LOG_FILE: Optional[Path] = None  # 在 main() 中设置
 _log_lock = threading.Lock()
 
 
@@ -285,6 +376,30 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .msg.other .meta button:hover { background: #f3f4f6; }
   .msg .meta .del-btn { color: inherit; opacity: .5; }
   .msg .meta .del-btn:hover { opacity: 1; }
+  .settings { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+              padding: 14px 16px; margin-top: 20px; }
+  .settings summary { font-size: 15px; color: #374151; cursor: pointer; user-select: none; }
+  .settings summary:focus { outline: none; }
+  .settings .body { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+  .settings .row { display: flex; align-items: center; gap: 10px; font-size: 13px;
+                    color: #6b7280; border-bottom: none; padding: 0; }
+  .settings .row label { min-width: 70px; }
+  .toggle { position: relative; display: inline-block; width: 40px; height: 22px; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+                    background: #d1d5db; border-radius: 22px; transition: .2s; }
+  .toggle .slider::before { content: ""; position: absolute; height: 16px; width: 16px;
+                            left: 3px; bottom: 3px; background: #fff; border-radius: 50%;
+                            transition: .2s; }
+  .toggle input:checked + .slider { background: #3b82f6; }
+  .toggle input:checked + .slider::before { transform: translateX(18px); }
+  .settings input[type="text"] { flex: 1; border: 1px solid #e5e7eb; border-radius: 6px;
+         padding: 5px 8px; font-size: 13px; font-family: inherit; }
+  .settings input[type="text"]:focus { outline: none; border-color: #3b82f6; }
+  .settings .save-btn { background: #3b82f6; color: #fff; border: none; border-radius: 8px;
+         padding: 7px 18px; font-size: 13px; cursor: pointer; align-self: flex-start; }
+  .settings .save-btn:hover { background: #2563eb; }
+  .settings .hint { font-size: 11px; color: #f59e0b; }
 </style>
 </head>
 <body>
@@ -311,6 +426,25 @@ PLACEHOLDER_HTML = r"""<!doctype html>
     </div>
   </div>
   <div class="chat-box" id="chatBox"></div>
+
+  <details class="settings" id="settingsPanel">
+    <summary>⚙️ 设置</summary>
+    <div class="body">
+      <div class="row">
+        <label>开机自启</label>
+        <label class="toggle">
+          <input type="checkbox" id="autoStartToggle" onchange="saveConfig()">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="row">
+        <label>保存目录</label>
+        <input type="text" id="shareDirInput" spellcheck="false">
+      </div>
+      <button class="save-btn" onclick="saveConfig()">保存</button>
+      <span class="hint" id="restartHint" style="display:none">⚠ 目录/端口/地址修改后需重启生效</span>
+    </div>
+  </details>
 </div>
 <script>
 const drop = document.getElementById('drop');
@@ -514,6 +648,42 @@ loadFiles();
 loadMessages();
 setInterval(loadFiles, 4000);
 connectSSE();
+
+// ---- 设置面板 ----
+const autoStartToggle = document.getElementById('autoStartToggle');
+const shareDirInput = document.getElementById('shareDirInput');
+const restartHint = document.getElementById('restartHint');
+
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/config');
+    const cfg = await res.json();
+    autoStartToggle.checked = cfg.autostart_actual;
+    shareDirInput.value = cfg.share_dir || '';
+  } catch {}
+}
+
+async function saveConfig() {
+  const body = { autostart: autoStartToggle.checked };
+  const dir = shareDirInput.value.trim();
+  if (dir) body.share_dir = dir;
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const cfg = await res.json();
+    autoStartToggle.checked = cfg.autostart_actual;
+    shareDirInput.value = cfg.share_dir || '';
+    if (cfg.restart_required) {
+      restartHint.style.display = '';
+      setTimeout(() => restartHint.style.display = 'none', 6000);
+    }
+  } catch {}
+}
+
+loadConfig();
 </script>
 </body>
 </html>
@@ -667,6 +837,55 @@ def message_stream():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# ---- 配置 API ----
+@app.route("/api/config")
+def get_config():
+    cfg = _load_config()
+    return jsonify({
+        **cfg,
+        "autostart_actual": _check_autostart(),  # 自启文件实际是否存在
+        "version": __version__,
+        "startup_dir": str(SHARE_DIR) if SHARE_DIR else "",
+    })
+
+
+@app.route("/api/config", methods=["POST"])
+def update_config():
+    data = request.get_json(silent=True) or {}
+    cfg = _load_config()
+    changed = False
+
+    if "autostart" in data:
+        val = bool(data["autostart"])
+        if val != cfg.get("autostart"):
+            cfg["autostart"] = val
+            _apply_autostart(val)
+            changed = True
+
+    if "share_dir" in data and isinstance(data["share_dir"], str):
+        path = data["share_dir"].strip()
+        if path and path != cfg.get("share_dir"):
+            cfg["share_dir"] = path
+            changed = True
+
+    if "port" in data and isinstance(data["port"], int):
+        cfg["port"] = data["port"]
+        changed = True
+
+    if "host" in data and isinstance(data["host"], str):
+        cfg["host"] = data["host"].strip() or "0.0.0.0"
+        changed = True
+
+    if changed:
+        _save_config(cfg)
+
+    return jsonify({
+        **cfg,
+        "autostart_actual": _check_autostart(),
+        "restart_required": any(k in data for k in ("share_dir", "port", "host")),
+    })
+
+
 def get_lan_ip() -> str:
     """获取本机在局域网中的 IP。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -703,15 +922,45 @@ def print_banner(ip: str, port: int):
 
 
 def main():
+    global SHARE_DIR, CHAT_FILE, LOG_FILE
+
+    # 1. 加载配置文件
+    cfg = _load_config()
+
+    # 2. 解析 CLI 参数(默认 None, 由后续优先级链填充)
     parser = argparse.ArgumentParser(description="局域网文件传输工具")
-    parser.add_argument("--port", type=int, default=9000, help="监听端口 (默认 9000)")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=None, help="监听端口")
+    parser.add_argument("--host", default=None, help="监听地址")
+    parser.add_argument("--dir", default=None, help="共享目录")
     args = parser.parse_args()
 
+    # 3. 优先级: CLI > 环境变量 > 配置文件 > 默认值
+    port = args.port or cfg.get("port", 9000)
+    host = args.host or cfg.get("host", "0.0.0.0")
+    share_dir = args.dir or os.environ.get("LAN_SHARE_DIR") or cfg.get("share_dir", "shared")
+
+    # 4. 设置全局 SHARE_DIR / CHAT_FILE / LOG_FILE
+    SHARE_DIR = Path(share_dir).resolve()
+    SHARE_DIR.mkdir(parents=True, exist_ok=True)
+    CHAT_FILE = SHARE_DIR / ".chat.json"
+    LOG_FILE = SHARE_DIR / ".lan-drop.log"
+
+    # 5. 回写最终值到配置(下次启动时可用)
+    cfg["port"] = port
+    cfg["host"] = host
+    cfg["share_dir"] = str(SHARE_DIR)
+    _save_config(cfg)
+
+    # 6. 应用开机自启设置
+    _apply_autostart(cfg.get("autostart", False))
+
+    # 7. 恢复聊天消息
     _load_messages()
+
+    # 8. 启动
     ip = get_lan_ip()
-    print_banner(ip, args.port)
-    app.run(host=args.host, port=args.port, threaded=True)
+    print_banner(ip, port)
+    app.run(host=host, port=port, threaded=True)
 
 
 if __name__ == "__main__":
