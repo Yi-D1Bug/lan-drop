@@ -4,11 +4,13 @@ import io
 import json
 import os
 import re
+import time
 import queue
 import socket
 import argparse
 import threading
 import unicodedata
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +25,7 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 
 SHARE_DIR = Path(os.environ.get("LAN_SHARE_DIR", "shared")).resolve()
 SHARE_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,6 +61,92 @@ def _broadcast_presence():
     with _sse_clients_lock:
         count = len(_sse_clients)
     _broadcast("presence", {"count": count})
+
+
+# ---- 速率限制 ----
+class RateLimiter:
+    """简单的滑动窗口速率限制器,按 IP 计数。"""
+
+    def __init__(self, max_req: int, window_sec: float):
+        self.max_req = max_req
+        self.window = window_sec
+        self._store: dict[str, list[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def check(self, ip: str) -> bool:
+        """返回 True 表示允许,False 表示被限流。"""
+        now = time.time()
+        with self._lock:
+            times = self._store.get(ip, [])
+            # 惰性清理过期记录
+            cutoff = now - self.window
+            while times and times[0] <= cutoff:
+                times.pop(0)
+            if len(times) >= self.max_req:
+                return False
+            times.append(now)
+            self._store[ip] = times
+            # 定期全量清理过期 IP,防止内存膨胀
+            if len(self._store) > 500:
+                self._store = defaultdict(list, {
+                    k: v for k, v in self._store.items()
+                    if any(t > cutoff for t in v)
+                })
+            return True
+
+
+_msg_limiter = RateLimiter(10, 10)      # 消息: 10 条 / 10 秒
+_upload_limiter = RateLimiter(30, 60)   # 上传: 30 次 / 分钟
+_delete_limiter = RateLimiter(20, 60)   # 删除: 20 次 / 分钟
+
+
+# ---- 消息持久化 ----
+CHAT_FILE = SHARE_DIR / ".chat.json"
+
+
+def _save_messages():
+    """将当前消息写入持久化文件。"""
+    try:
+        with _messages_lock:
+            with open(CHAT_FILE, "w", encoding="utf-8") as f:
+                json.dump(list(_messages), f, ensure_ascii=False)
+    except OSError:
+        pass  # 写入失败不阻塞正常流程
+
+
+def _load_messages():
+    """启动时从持久化文件恢复消息。"""
+    global _msg_seq
+    if not CHAT_FILE.is_file():
+        return
+    try:
+        with open(CHAT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return
+        with _messages_lock:
+            _messages[:] = data[-MAX_MESSAGES:]
+            if _messages:
+                _msg_seq = max(m["id"] for m in _messages)
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+
+
+# ---- 操作日志 ----
+LOG_FILE = SHARE_DIR / ".lan-drop.log"
+_log_lock = threading.Lock()
+
+
+def _log_operation(action: str, filename: str, ip: str):
+    """追加一行操作日志:时间\tIP\t动作\t文件名。"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{timestamp}\t{ip}\t{action}\t{filename}\n"
+    try:
+        with _log_lock:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError:
+        pass
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None  # 不限制单次上传大小
@@ -237,6 +325,18 @@ picker.onchange = () => { uploadFiles(picker.files); picker.value = ''; };
 ['dragleave','drop'].forEach(e =>
   drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
 drop.addEventListener('drop', ev => uploadFiles(ev.dataTransfer.files));
+
+	// Ctrl+V 粘贴上传(不在输入框内粘贴时触发)
+	document.addEventListener('paste', e => {
+	  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+	  const items = e.clipboardData?.items;
+	  if (!items) return;
+	  const files = [];
+	  for (const item of items) {
+	    if (item.kind === 'file') files.push(item.getAsFile());
+	  }
+	  if (files.length) { e.preventDefault(); uploadFiles(files); }
+	});
 
 function uploadFiles(files) {
   if (!files || !files.length) return;
@@ -429,7 +529,7 @@ def index():
 def list_files():
     files = []
     for p in SHARE_DIR.iterdir():
-        if p.is_file():
+        if p.is_file() and not p.name.startswith("."):
             stat = p.stat()
             files.append(
                 {
@@ -447,6 +547,9 @@ def list_files():
 
 @app.route("/api/upload", methods=["POST"])
 def upload():
+    ip = request.remote_addr or "?"
+    if not _upload_limiter.check(ip):
+        return jsonify({"error": "请求过于频繁,请稍后再试"}), 429
     uploaded = request.files.getlist("files")
     if not uploaded:
         return jsonify({"error": "没有文件"}), 400
@@ -457,6 +560,7 @@ def upload():
         target = unique_target(f.filename)
         f.save(target)
         saved.append(target.name)
+        _log_operation("UPLOAD", target.name, ip)
     return jsonify({"saved": saved})
 
 
@@ -465,15 +569,20 @@ def download(filename):
     target = safe_target(filename)
     if not target.is_file():
         abort(404)
+    _log_operation("DOWNLOAD", target.name, request.remote_addr or "?")
     return send_from_directory(SHARE_DIR, target.name, as_attachment=True)
 
 
 @app.route("/api/delete/<path:filename>", methods=["POST"])
 def delete(filename):
+    ip = request.remote_addr or "?"
+    if not _delete_limiter.check(ip):
+        return jsonify({"error": "请求过于频繁,请稍后再试"}), 429
     target = safe_target(filename)
     if not target.is_file():
         abort(404)
     target.unlink()
+    _log_operation("DELETE", target.name, ip)
     return jsonify({"deleted": target.name})
 
 
@@ -486,6 +595,9 @@ def list_messages():
 @app.route("/api/messages", methods=["POST"])
 def post_message():
     global _msg_seq
+    ip = request.remote_addr or "?"
+    if not _msg_limiter.check(ip):
+        return jsonify({"error": "发言过于频繁,请稍后再试"}), 429
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     if not text:
@@ -499,11 +611,12 @@ def post_message():
             "id": _msg_seq,
             "text": text,
             "nickname": nickname,
-            "ip": request.remote_addr or "?",
+            "ip": ip,
             "time": datetime.now().strftime("%H:%M:%S"),
         }
         _messages.insert(0, msg)
         del _messages[MAX_MESSAGES:]
+    _save_messages()
     _broadcast("message", msg)
     return jsonify(msg)
 
@@ -516,6 +629,7 @@ def delete_message(msg_id):
         deleted = before != len(_messages)
     if not deleted:
         abort(404)
+    _save_messages()
     _broadcast("delete", {"id": msg_id})
     return jsonify({"deleted": msg_id})
 
@@ -594,6 +708,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
     args = parser.parse_args()
 
+    _load_messages()
     ip = get_lan_ip()
     print_banner(ip, args.port)
     app.run(host=args.host, port=args.port, threaded=True)
