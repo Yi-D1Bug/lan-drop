@@ -28,7 +28,7 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # 配置文件目录(平台相关,不依赖 SHARE_DIR)
 if platform.system() == "Windows":
@@ -283,18 +283,22 @@ def safe_target(filename: str) -> Path:
     return target
 
 
+_target_lock = threading.Lock()  # 保护 unique_target 的 check-then-create
+
+
 def unique_target(filename: str) -> Path:
-    """同名文件自动加序号,避免覆盖已有文件。"""
-    target = safe_target(filename)
-    if not target.exists():
-        return target
-    stem, suffix = target.stem, target.suffix
-    i = 1
-    while True:
-        candidate = safe_target(f"{stem}({i}){suffix}")
-        if not candidate.exists():
-            return candidate
-        i += 1
+    """同名文件自动加序号,避免覆盖已有文件(线程安全)。"""
+    with _target_lock:
+        target = safe_target(filename)
+        if not target.exists():
+            return target
+        stem, suffix = target.stem, target.suffix
+        i = 1
+        while True:
+            candidate = safe_target(f"{stem}({i}){suffix}")
+            if not candidate.exists():
+                return candidate
+            i += 1
 
 
 def human_size(num: int) -> str:
@@ -318,6 +322,9 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .wrap { max-width: 760px; margin: 0 auto; }
   h1 { font-size: 20px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
   h1 .ver { font-size: 12px; font-weight: normal; color: #9ca3af; }
+  .share-dir { font-size: 11px; color: #9ca3af; margin-bottom: 12px;
+               word-break: break-all; background: #fff; display: inline-block;
+               padding: 3px 10px; border-radius: 6px; }
   .drop { border: 2px dashed #b9c0cc; border-radius: 12px; background: #fff;
           padding: 36px 16px; text-align: center; cursor: pointer; transition: .15s; }
   .drop.over { border-color: #3b82f6; background: #eff6ff; }
@@ -405,6 +412,7 @@ PLACEHOLDER_HTML = r"""<!doctype html>
 <body>
 <div class="wrap">
   <h1>📁 局域网文件传输 <span class="ver">v{{ version }}</span></h1>
+  <div class="share-dir">📂 {{ share_dir }}</div>
   <div class="drop" id="drop">
     <p><strong>点击选择</strong> 或拖拽文件到此处上传</p>
     <p style="margin-top:6px;font-size:12px;">局域网内任意设备均可下载</p>
@@ -490,9 +498,17 @@ function uploadFiles(files) {
     if (e.lengthComputable) fill.style.width = (e.loaded / e.total * 100) + '%';
   };
   xhr.onload = () => {
-    fill.style.width = '100%';
-    setTimeout(() => bar.remove(), 800);
-    loadFiles();
+    if (xhr.status === 200) {
+      try {
+        const r = JSON.parse(xhr.responseText);
+        if (r.error) { bar.querySelector('div').textContent = '❌ ' + r.error; return; }
+        fill.style.width = '100%';
+        setTimeout(() => bar.remove(), 800);
+        loadFiles();
+        return;
+      } catch {}
+    }
+    bar.querySelector('div').textContent = '❌ 上传失败 (' + xhr.status + ')';
   };
   xhr.onerror = () => { bar.querySelector('div').textContent = '❌ 上传失败: ' + total; };
   xhr.send(fd);
@@ -692,7 +708,7 @@ loadConfig();
 
 @app.route("/")
 def index():
-    return render_template_string(PLACEHOLDER_HTML, version=__version__)
+    return render_template_string(PLACEHOLDER_HTML, version=__version__, share_dir=str(SHARE_DIR))
 
 
 @app.route("/api/files")
@@ -729,9 +745,13 @@ def upload():
             continue
         target = unique_target(f.filename)
         f.save(target)
-        saved.append(target.name)
-        _log_operation("UPLOAD", target.name, ip)
-    return jsonify({"saved": saved})
+        # 写入后立即验证文件确实存在,防御静默写入失败
+        if target.is_file():
+            saved.append({"name": target.name, "size": target.stat().st_size})
+            _log_operation("UPLOAD", target.name, ip)
+    if not saved:
+        return jsonify({"error": "所有文件保存失败,请检查磁盘空间或权限"}), 500
+    return jsonify({"saved": saved, "dir": str(SHARE_DIR)})
 
 
 @app.route("/download/<path:filename>")
