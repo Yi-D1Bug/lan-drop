@@ -380,8 +380,8 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .composer .send { background: #3b82f6; color: #fff;
          border: none; border-radius: 8px; padding: 8px 20px; font-size: 14px; cursor: pointer; }
   .composer .send:hover { background: #2563eb; }
-  .chat-box { margin-top: 12px; max-height: 420px; overflow-y: auto; padding: 4px 0; }
-  .msg-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: flex-end;
+  .chat-box { margin-top: 12px; max-height: 420px; overflow-y: auto; padding: 10px; background: #f9fafb; border-radius: 12px; }
+  .msg-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: flex-start;
              animation: msgIn .3s ease; }
   .msg-row.self { flex-direction: row-reverse; }
   @keyframes msgIn { from { opacity: 0; transform: translateY(10px); }
@@ -390,19 +390,18 @@ PLACEHOLDER_HTML = r"""<!doctype html>
                 align-items: center; justify-content: center; font-size: 13px;
                 font-weight: 600; color: #fff; flex-shrink: 0; line-height: 1; }
   .msg-bubble { max-width: 75%; }
-  .msg-nick { font-size: 11px; margin-bottom: 3px; padding: 0 4px; }
-  .msg-row.self .msg-nick { text-align: right; color: #9ca3af; }
-  .msg-row.other .msg-nick { color: #6b7280; }
+  .msg-nick { font-size: 11px; margin-bottom: 2px; padding: 0 6px; color: #6b7280; }
+  .msg-row.self .msg-nick { text-align: right; }
   .msg-body { padding: 9px 14px; border-radius: 18px; font-size: 14px;
               line-height: 1.5; word-break: break-all; white-space: pre-wrap; }
-  .msg-row.self .msg-body { background: #3b82f6; color: #fff; border-bottom-right-radius: 6px; }
-  .msg-row.other .msg-body { background: #fff; color: #222; border-bottom-left-radius: 6px;
-                             box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-  .msg-actions { display: flex; align-items: center; gap: 4px; margin-top: 3px;
-                 padding: 0 4px; opacity: 0; transition: opacity .15s; }
+  .msg-row.self .msg-body { background: #3b82f6; color: #fff; border-bottom-right-radius: 4px; }
+  .msg-row.other .msg-body { background: #fff; color: #222; border-bottom-left-radius: 4px;
+                             box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .msg-actions { display: flex; align-items: center; gap: 4px; margin-top: 2px;
+                 padding: 0 6px; opacity: 0; transition: opacity .15s; }
   .msg-bubble:hover .msg-actions { opacity: 1; }
   .msg-row.self .msg-actions { justify-content: flex-end; }
-  .msg-time { font-size: 10px; }
+  .msg-time { font-size: 10px; opacity: .6; }
   .msg-row.self .msg-time { color: rgba(255,255,255,.5); }
   .msg-row.other .msg-time { color: #b0b7c3; }
   .msg-actions button { font-size: 10px; border: none; background: none; cursor: pointer;
@@ -844,7 +843,7 @@ function renderMsg(m) {
   return `<div class="msg-row ${isSelf ? 'self' : 'other'}" id="msg-${m.id}">
     <div class="msg-avatar" style="background:${av.color}">${av.char}</div>
     <div class="msg-bubble">
-      <div class="msg-nick">${escapeHtml(m.nickname || m.ip)}</div>
+      ${isSelf ? '' : `<div class="msg-nick">${escapeHtml(m.nickname || m.ip)}</div>`}
       <div class="msg-body">${escapeHtml(m.text)}</div>
       <div class="msg-actions">
         <span class="msg-time">${m.time}</span>
