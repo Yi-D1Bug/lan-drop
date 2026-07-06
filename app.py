@@ -380,25 +380,37 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .composer .send { background: #3b82f6; color: #fff;
          border: none; border-radius: 8px; padding: 8px 20px; font-size: 14px; cursor: pointer; }
   .composer .send:hover { background: #2563eb; }
-  .chat-box { margin-top: 12px; max-height: 420px; overflow-y: auto; display: flex;
-         flex-direction: column; gap: 8px; padding: 4px 0; }
-  .msg { max-width: 80%; padding: 8px 14px; border-radius: 12px; position: relative;
-         word-break: break-all; white-space: pre-wrap; line-height: 1.5; font-size: 14px; }
-  .msg.self { align-self: flex-end; background: #3b82f6; color: #fff; border-bottom-right-radius: 4px; }
-  .msg.other { align-self: flex-start; background: #fff; color: #222; border-bottom-left-radius: 4px;
-         box-shadow: 0 1px 2px rgba(0,0,0,.06); }
-  .msg .nick { font-size: 11px; opacity: .7; margin-bottom: 2px; }
-  .msg.self .nick { color: rgba(255,255,255,.8); }
-  .msg.other .nick { color: #9ca3af; }
-  .msg .meta { font-size: 11px; opacity: .6; margin-top: 3px; display: flex; align-items: center; gap: 6px; }
-  .msg .meta button { font-size: 11px; border: none; background: none; cursor: pointer;
-         padding: 2px 6px; border-radius: 4px; opacity: .7; }
-  .msg.self .meta button { color: #fff; }
-  .msg.self .meta button:hover { background: rgba(255,255,255,.2); }
-  .msg.other .meta button { color: #6b7280; }
-  .msg.other .meta button:hover { background: #f3f4f6; }
-  .msg .meta .del-btn { color: inherit; opacity: .5; }
-  .msg .meta .del-btn:hover { opacity: 1; }
+  .chat-box { margin-top: 12px; max-height: 420px; overflow-y: auto; padding: 4px 0; }
+  .msg-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: flex-end;
+             animation: msgIn .3s ease; }
+  .msg-row.self { flex-direction: row-reverse; }
+  @keyframes msgIn { from { opacity: 0; transform: translateY(10px); }
+                     to { opacity: 1; transform: translateY(0); } }
+  .msg-avatar { width: 32px; height: 32px; border-radius: 50%; display: flex;
+                align-items: center; justify-content: center; font-size: 13px;
+                font-weight: 600; color: #fff; flex-shrink: 0; line-height: 1; }
+  .msg-bubble { max-width: 75%; }
+  .msg-nick { font-size: 11px; margin-bottom: 3px; padding: 0 4px; }
+  .msg-row.self .msg-nick { text-align: right; color: #9ca3af; }
+  .msg-row.other .msg-nick { color: #6b7280; }
+  .msg-body { padding: 9px 14px; border-radius: 18px; font-size: 14px;
+              line-height: 1.5; word-break: break-all; white-space: pre-wrap; }
+  .msg-row.self .msg-body { background: #3b82f6; color: #fff; border-bottom-right-radius: 6px; }
+  .msg-row.other .msg-body { background: #fff; color: #222; border-bottom-left-radius: 6px;
+                             box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .msg-actions { display: flex; align-items: center; gap: 4px; margin-top: 3px;
+                 padding: 0 4px; opacity: 0; transition: opacity .15s; }
+  .msg-bubble:hover .msg-actions { opacity: 1; }
+  .msg-row.self .msg-actions { justify-content: flex-end; }
+  .msg-time { font-size: 10px; }
+  .msg-row.self .msg-time { color: rgba(255,255,255,.5); }
+  .msg-row.other .msg-time { color: #b0b7c3; }
+  .msg-actions button { font-size: 10px; border: none; background: none; cursor: pointer;
+                        padding: 2px 6px; border-radius: 4px; }
+  .msg-row.self .msg-actions button { color: rgba(255,255,255,.6); }
+  .msg-row.self .msg-actions button:hover { background: rgba(255,255,255,.15); color: #fff; }
+  .msg-row.other .msg-actions button { color: #9ca3af; }
+  .msg-row.other .msg-actions button:hover { background: #f3f4f6; color: #6b7280; }
   .settings { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
               padding: 14px 16px; margin-top: 20px; }
   .settings summary { font-size: 15px; color: #374151; cursor: pointer; user-select: none; }
@@ -819,15 +831,26 @@ async function sendMessage() {
   } finally { msgSend.disabled = false; }
 }
 
+const AVATAR_COLORS = ['#ef4444','#f59e0b','#10b981','#3b82f6','#8b5cf6','#ec4899','#06b6d4','#f97316'];
+function avatarFor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) { h = ((h << 5) - h) + name.charCodeAt(i); h |= 0; }
+  return { char: name.charAt(0).toUpperCase(), color: AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length] };
+}
+
 function renderMsg(m) {
   const isSelf = m.nickname === getMyNick();
-  const cls = isSelf ? 'msg self' : 'msg other';
-  return `<div class="${cls}" id="msg-${m.id}">
-    <div class="nick">${escapeHtml(m.nickname || m.ip)}</div>
-    <span class="msg-text">${escapeHtml(m.text)}</span>
-    <div class="meta"><span>${m.time}</span>
-      <button onclick="copyMsg(${m.id},this)">复制</button>
-      <button class="del-btn" onclick="delMsg(${m.id})">删除</button>
+  const av = avatarFor(m.nickname || m.ip);
+  return `<div class="msg-row ${isSelf ? 'self' : 'other'}" id="msg-${m.id}">
+    <div class="msg-avatar" style="background:${av.color}">${av.char}</div>
+    <div class="msg-bubble">
+      <div class="msg-nick">${escapeHtml(m.nickname || m.ip)}</div>
+      <div class="msg-body">${escapeHtml(m.text)}</div>
+      <div class="msg-actions">
+        <span class="msg-time">${m.time}</span>
+        <button onclick="copyMsg(${m.id},this)">复制</button>
+        <button onclick="delMsg(${m.id})">删除</button>
+      </div>
     </div>
   </div>`;
 }
@@ -851,7 +874,7 @@ function removeMsg(id) {
 }
 
 function copyMsg(id, btn) {
-  const el = document.querySelector('#msg-' + id + ' .msg-text');
+  const el = document.querySelector('#msg-' + id + ' .msg-body');
   if (!el) return;
   const text = el.textContent;
   try {
