@@ -23,6 +23,7 @@ from flask import (
     request,
     jsonify,
     send_from_directory,
+    send_file,
     abort,
     render_template_string,
     stream_with_context,
@@ -226,6 +227,9 @@ def _load_messages():
 # ---- 操作日志 ----
 LOG_FILE: Optional[Path] = None  # 在 main() 中设置
 _log_lock = threading.Lock()
+
+# 局域网访问地址,在 main() 启动时设置,供 QR 码 API 使用
+_lan_url: Optional[str] = None
 
 
 def _log_operation(action: str, filename: str, ip: str):
@@ -460,12 +464,30 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .sel-bar .sel-del:hover { background: #dc2626; }
   .row .row-cb { width: 16px; height: 16px; cursor: pointer; accent-color: #3b82f6;
                  flex-shrink: 0; margin-right: 2px; }
+  .qr-box { display: flex; align-items: center; gap: 10px; background: #fff;
+            border-radius: 10px; padding: 8px 12px; margin-bottom: 12px;
+            box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  .qr-img { width: 68px; height: 68px; border-radius: 6px; flex-shrink: 0; }
+  .qr-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .qr-label { font-size: 11px; color: #9ca3af; }
+  .qr-addr { font-size: 12px; color: #3b82f6; word-break: break-all; }
+  .qr-copy { font-size: 18px; border: none; background: none; cursor: pointer;
+             padding: 4px 6px; border-radius: 6px; flex-shrink: 0; line-height: 1; }
+  .qr-copy:hover { background: #f3f4f6; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>📁 局域网文件传输 <span class="ver">v{{ version }}</span></h1>
   <div class="share-dir">📂 {{ share_dir }}</div>
+  <div class="qr-box" id="qrBox">
+    <img class="qr-img" src="/api/qrcode" alt="QR" onerror="this.parentElement.style.display='none'">
+    <div class="qr-text">
+      <span class="qr-label">📱 手机扫码访问</span>
+      <span class="qr-addr">{{ lan_url }}</span>
+    </div>
+    <button class="qr-copy" onclick="copyLanUrl()" title="复制地址">📋</button>
+  </div>
   <div class="drop" id="drop">
     <p><strong>点击选择</strong> 或拖拽文件到此处上传</p>
     <p style="margin-top:6px;font-size:12px;">局域网内任意设备均可下载</p>
@@ -791,6 +813,16 @@ function escapeHtml(s) {
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+function copyLanUrl() {
+  const el = document.querySelector('.qr-addr');
+  if (!el) return;
+  const text = el.textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('.qr-copy');
+    if (btn) { btn.textContent = '✅'; setTimeout(() => btn.textContent = '📋', 1200); }
+  }).catch(() => {});
+}
+
 // ---- 聊天室 ----
 const msgInput = document.getElementById('msgInput');
 const msgSend = document.getElementById('msgSend');
@@ -973,7 +1005,7 @@ loadConfig();
 
 @app.route("/")
 def index():
-    return render_template_string(PLACEHOLDER_HTML, version=__version__, share_dir=str(SHARE_DIR))
+    return render_template_string(PLACEHOLDER_HTML, version=__version__, share_dir=str(SHARE_DIR), lan_url=_lan_url or "")
 
 
 @app.route("/api/files")
@@ -1194,6 +1226,26 @@ def update_config():
     })
 
 
+@app.route("/api/qrcode")
+def qrcode_image():
+    """生成局域网访问地址的二维码图片(PNG)。需要安装 qrcode[pil]。"""
+    url = _lan_url or ""
+    if not url:
+        abort(404)
+    try:
+        import qrcode
+    except ImportError:
+        abort(404, "qrcode not installed")
+    try:
+        img = qrcode.make(url, border=2)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
+    except Exception:
+        abort(404)
+
+
 def get_lan_ip() -> str:
     """获取本机在局域网中的 IP。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1230,7 +1282,7 @@ def print_banner(ip: str, port: int):
 
 
 def main():
-    global SHARE_DIR, CHAT_FILE, LOG_FILE
+    global SHARE_DIR, CHAT_FILE, LOG_FILE, _lan_url
 
     # 1. 加载配置文件
     cfg = _load_config()
@@ -1267,6 +1319,7 @@ def main():
 
     # 8. 启动
     ip = get_lan_ip()
+    _lan_url = f"http://{ip}:{port}"
     print_banner(ip, port)
     app.run(host=host, port=port, threaded=True)
 
