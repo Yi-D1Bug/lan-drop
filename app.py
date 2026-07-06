@@ -28,7 +28,7 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 # 配置文件目录(平台相关,不依赖 SHARE_DIR)
 if platform.system() == "Windows":
@@ -347,6 +347,16 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .row .del { color: #ef4444; }
   .row .del:hover { background: #fef2f2; }
   .empty { padding: 40px; text-align: center; color: #9ca3af; font-size: 14px; }
+  .cat-header { display: flex; align-items: center; padding: 9px 16px;
+         background: #f9fafb; border-bottom: 1px solid #f0f1f3; cursor: pointer;
+         user-select: none; font-size: 13px; font-weight: 500; color: #4b5563; }
+  .cat-header:hover { background: #f3f4f6; }
+  .cat-chevron { font-size: 10px; margin-right: 6px; width: 14px; text-align: center;
+                  transition: transform .15s; display: inline-block; }
+  .cat-chevron.open { transform: rotate(90deg); }
+  .cat-count { margin-left: auto; font-size: 11px; color: #6b7280;
+               background: #e5e7eb; border-radius: 10px; padding: 1px 8px; }
+  .cat-body .row { padding-left: 36px; }
   h2 { font-size: 15px; margin: 24px 0 10px; color: #374151; }
   .online { font-size: 12px; font-weight: normal; color: #10b981; margin-left: 6px; }
   .online.off { color: #9ca3af; }
@@ -514,17 +524,68 @@ function uploadFiles(files) {
   xhr.send(fd);
 }
 
+// 文件类型分类
+const FILE_CATS = [
+  ['🖼️ 图片',   'jpg jpeg png gif bmp svg webp ico heic tiff tif raw'],
+  ['📄 文档',   'pdf doc docx xls xlsx ppt pptx txt md csv json xml html rtf odt'],
+  ['🎬 视频',   'mp4 avi mkv mov wmv flv webm m4v mpg mpeg 3gp'],
+  ['🎵 音频',   'mp3 wav flac aac ogg wma m4a opus'],
+  ['📦 压缩包', 'zip rar 7z tar gz bz2 xz iso dmg'],
+];
+
+function getCat(filename) {
+  const ext = filename.split('.').pop().toLowerCase();
+  for (const [cat, exts] of FILE_CATS) {
+    if (exts.includes(ext)) return cat;
+  }
+  return '📁 其他';
+}
+
 async function loadFiles() {
   const res = await fetch('/api/files');
   const files = await res.json();
   if (!files.length) { list.innerHTML = '<div class="empty">暂无文件,上传一个试试</div>'; return; }
-  list.innerHTML = files.map(f => `
-    <div class="row">
-      <span class="name">${escapeHtml(f.name)}</span>
-      <span class="meta">${f.size_h} · ${f.mtime}</span>
-      <a href="/download/${encodeURIComponent(f.name)}">下载</a>
-      <button class="del" onclick="del('${encodeURIComponent(f.name)}')">删除</button>
-    </div>`).join('');
+
+  // 分组
+  const order = FILE_CATS.map(c => c[0]).concat(['📁 其他']);
+  const groups = {};
+  for (const f of files) {
+    const cat = getCat(f.name);
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(f);
+  }
+
+  let html = '';
+  for (const cat of order) {
+    const items = groups[cat];
+    if (!items || !items.length) continue;
+    const collapsed = localStorage.getItem('lan_cat_' + cat) === '1';
+    html += `<div class="cat-header" data-cat="${cat}" onclick="toggleCat(this)">
+      <span class="cat-chevron${collapsed ? '' : ' open'}">▶</span>
+      <span>${cat}</span>
+      <span class="cat-count">${items.length}</span>
+    </div>`;
+    html += `<div class="cat-body" style="${collapsed ? 'display:none' : ''}">`;
+    html += items.map(f => `
+      <div class="row">
+        <span class="name">${escapeHtml(f.name)}</span>
+        <span class="meta">${f.size_h} · ${f.mtime}</span>
+        <a href="/download/${encodeURIComponent(f.name)}">下载</a>
+        <button class="del" onclick="del('${encodeURIComponent(f.name)}')">删除</button>
+      </div>`).join('');
+    html += '</div>';
+  }
+  list.innerHTML = html;
+}
+
+function toggleCat(el) {
+  const cat = el.dataset.cat;
+  const body = el.nextElementSibling;
+  const chevron = el.querySelector('.cat-chevron');
+  const collapsed = body.style.display === 'none';
+  body.style.display = collapsed ? '' : 'none';
+  chevron.classList.toggle('open', collapsed);
+  localStorage.setItem('lan_cat_' + cat, collapsed ? '0' : '1');
 }
 
 async function del(name) {
