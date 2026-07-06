@@ -28,7 +28,7 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # 配置文件目录(平台相关,不依赖 SHARE_DIR)
 if platform.system() == "Windows":
@@ -357,6 +357,12 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .cat-count { margin-left: auto; font-size: 11px; color: #6b7280;
                background: #e5e7eb; border-radius: 10px; padding: 1px 8px; }
   .cat-body .row { padding-left: 36px; }
+  .search-box { display: flex; align-items: center; gap: 8px; margin: 12px 0;
+         background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; }
+  .search-box:focus-within { border-color: #3b82f6; }
+  .search-icon { font-size: 16px; }
+  .search-box input { flex: 1; border: none; outline: none; font-size: 14px;
+         font-family: inherit; background: transparent; }
   h2 { font-size: 15px; margin: 24px 0 10px; color: #374151; }
   .online { font-size: 12px; font-weight: normal; color: #10b981; margin-left: 6px; }
   .online.off { color: #9ca3af; }
@@ -417,6 +423,18 @@ PLACEHOLDER_HTML = r"""<!doctype html>
          padding: 7px 18px; font-size: 13px; cursor: pointer; align-self: flex-start; }
   .settings .save-btn:hover { background: #2563eb; }
   .settings .hint { font-size: 11px; color: #f59e0b; }
+  #notify { position: fixed; bottom: 24px; right: 24px; z-index: 1000; max-width: 320px; }
+  .toast { background: #10b981; color: #fff; padding: 12px 16px; border-radius: 8px;
+           box-shadow: 0 4px 12px rgba(0,0,0,.15); font-size: 14px; cursor: pointer;
+           margin-bottom: 8px; animation: slideIn .3s ease; }
+  .toast:hover { background: #059669; }
+  @keyframes slideIn { from { transform: translateX(400px); opacity: 0; }
+                       to { transform: translateX(0); opacity: 1; } }
+  .toast.fade-out { animation: fadeOut .3s ease forwards; }
+  @keyframes fadeOut { to { opacity: 0; transform: translateY(10px); } }
+  .row.highlight { animation: highlight 1s ease; }
+  @keyframes highlight { 0%, 100% { background: transparent; }
+                         50% { background: #fef3c7; } }
 </style>
 </head>
 <body>
@@ -429,6 +447,10 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   </div>
   <input type="file" id="picker" multiple hidden>
   <div id="bars"></div>
+  <div class="search-box">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="searchInput" placeholder="搜索文件..." spellcheck="false">
+  </div>
   <div class="list" id="list"><div class="empty">加载中…</div></div>
 
   <h2>💬 聊天室 <span id="online" class="online">● 在线 1</span></h2>
@@ -469,6 +491,7 @@ const drop = document.getElementById('drop');
 const picker = document.getElementById('picker');
 const bars = document.getElementById('bars');
 const list = document.getElementById('list');
+const searchInput = document.getElementById('searchInput');
 
 drop.onclick = () => picker.click();
 picker.onchange = () => { uploadFiles(picker.files); picker.value = ''; };
@@ -477,6 +500,15 @@ picker.onchange = () => { uploadFiles(picker.files); picker.value = ''; };
 ['dragleave','drop'].forEach(e =>
   drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
 drop.addEventListener('drop', ev => uploadFiles(ev.dataTransfer.files));
+
+// 搜索框实时过滤
+let searchTimeout;
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(() => {
+    renderFiles(allFiles, searchInput.value.trim());
+  }, 300);
+});
 
 	// Ctrl+V 粘贴上传(不在输入框内粘贴时触发)
 	document.addEventListener('paste', e => {
@@ -515,6 +547,10 @@ function uploadFiles(files) {
         fill.style.width = '100%';
         setTimeout(() => bar.remove(), 800);
         loadFiles();
+        // 显示上传成功通知
+        if (r.saved && r.saved.length) {
+          showNotify(`✅ ${r.saved.length} 个文件已上传`, r.saved[0].name);
+        }
         return;
       } catch {}
     }
@@ -522,6 +558,37 @@ function uploadFiles(files) {
   };
   xhr.onerror = () => { bar.querySelector('div').textContent = '❌ 上传失败: ' + total; };
   xhr.send(fd);
+}
+
+function showNotify(msg, firstFilename) {
+  const notify = document.getElementById('notify');
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.textContent = msg;
+  toast.onclick = () => {
+    // 清空搜索、滚动到文件并高亮
+    searchInput.value = '';
+    renderFiles(allFiles, '');
+    setTimeout(() => {
+      const rows = list.querySelectorAll('.row .name');
+      for (const row of rows) {
+        if (row.textContent === firstFilename) {
+          row.closest('.row').scrollIntoView({ behavior: 'smooth', block: 'center' });
+          row.closest('.row').classList.add('highlight');
+          setTimeout(() => row.closest('.row').classList.remove('highlight'), 1000);
+          break;
+        }
+      }
+    }, 100);
+    toast.classList.add('fade-out');
+    setTimeout(() => toast.remove(), 300);
+  };
+  notify.innerHTML = ''; // 清除旧通知
+  notify.appendChild(toast);
+  setTimeout(() => {
+    toast.classList.add('fade-out');
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
 }
 
 // 文件类型分类
@@ -541,12 +608,40 @@ function getCat(filename) {
   return '📁 其他';
 }
 
+let allFiles = [];
+
 async function loadFiles() {
   const res = await fetch('/api/files');
-  const files = await res.json();
-  if (!files.length) { list.innerHTML = '<div class="empty">暂无文件,上传一个试试</div>'; return; }
+  allFiles = await res.json();
+  renderFiles(allFiles);
+}
 
-  // 分组
+function renderFiles(files, searchQuery = '') {
+  if (!files.length) {
+    list.innerHTML = '<div class="empty">暂无文件,上传一个试试</div>';
+    return;
+  }
+
+  // 搜索过滤
+  if (searchQuery) {
+    const q = searchQuery.toLowerCase();
+    files = files.filter(f => f.name.toLowerCase().includes(q));
+    if (!files.length) {
+      list.innerHTML = '<div class="empty">未找到匹配文件</div>';
+      return;
+    }
+    // 搜索模式：平铺显示，不分组
+    list.innerHTML = files.map(f => `
+      <div class="row">
+        <span class="name">${escapeHtml(f.name)}</span>
+        <span class="meta">${f.size_h} · ${f.mtime}</span>
+        <a href="/download/${encodeURIComponent(f.name)}">下载</a>
+        <button class="del" onclick="del('${encodeURIComponent(f.name)}')">删除</button>
+      </div>`).join('');
+    return;
+  }
+
+  // 分组模式
   const order = FILE_CATS.map(c => c[0]).concat(['📁 其他']);
   const groups = {};
   for (const f of files) {
@@ -762,6 +857,7 @@ async function saveConfig() {
 
 loadConfig();
 </script>
+<div id="notify"></div>
 </body>
 </html>
 """
