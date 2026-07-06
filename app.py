@@ -524,12 +524,22 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .log-toolbar button { font-size: 11px; border: 1px solid #e5e7eb; background: #fff;
                         border-radius: 5px; padding: 4px 12px; cursor: pointer; color: #6b7280; }
   .log-toolbar button:hover { background: #f3f4f6; }
-  .log-lines { background: #1e1e2e; color: #cdd6f4; padding: 12px 14px; border-radius: 8px;
-               font-size: 11px; line-height: 1.8; max-height: 320px; overflow: auto;
-               white-space: pre-wrap; word-break: break-all;
-               font-family: "Cascadia Code", "Fira Code", "Consolas", "Monaco", monospace; }
-  .log-lines.placeholder { color: #9ca3af; text-align: center; padding: 28px;
-                            background: #f9fafb; font-family: inherit; }
+  .log-container { background: #1e1e2e; border-radius: 8px; padding: 8px 0;
+                   max-height: 360px; overflow: auto; }
+  .log-container.placeholder { color: #9ca3af; text-align: center; padding: 28px;
+                               background: #f9fafb; font-family: inherit; }
+  .log-row { display: flex; align-items: center; gap: 10px; padding: 5px 14px;
+             font-size: 12px; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .log-row:last-child { border-bottom: none; }
+  .log-time { color: #a0a8c0; font-family: monospace; font-size: 11px; flex-shrink: 0; }
+  .log-tag { padding: 1px 8px; border-radius: 4px; font-size: 10px; font-weight: 600;
+             flex-shrink: 0; min-width: 32px; text-align: center; }
+  .log-tag.upload { background: #065f46; color: #6ee7b7; }
+  .log-tag.download { background: #1e3a5f; color: #93c5fd; }
+  .log-tag.delete { background: #7f1d1d; color: #fca5a5; }
+  .log-ip { color: #7c85a0; font-family: monospace; font-size: 11px; flex-shrink: 0;
+            min-width: 100px; }
+  .log-file { color: #cdd6f4; flex: 1; word-break: break-all; font-size: 12px; }
   .log-badge { font-size: 10px; background: #ef4444; color: #fff; border-radius: 8px;
                padding: 1px 7px; margin-left: 4px; }
 </style>
@@ -602,7 +612,7 @@ PLACEHOLDER_HTML = r"""<!doctype html>
       <span class="log-info" id="logInfo">点击加载查看操作记录</span>
       <button onclick="loadLogs()">加载日志</button>
     </div>
-    <pre class="log-lines placeholder" id="logLines">点击"加载日志"查看（需管理员密码）</pre>
+    <div class="log-container placeholder" id="logLines">点击"加载日志"查看（需管理员密码）</div>
   </details>
 </div>
 <div class="admin-overlay" id="adminOverlay" style="display:none">
@@ -1127,19 +1137,28 @@ async function loadLogs() {
     });
     if (res.status === 403) {
       document.getElementById('logLines').textContent = '密码错误';
-      document.getElementById('logLines').className = 'log-lines placeholder';
+      document.getElementById('logLines').className = 'log-container placeholder';
       adminVerified = false;
       sessionStorage.removeItem('lan_admin_pw');
       return;
     }
     const data = await res.json();
     const el = document.getElementById('logLines');
-    if (data.lines.length) {
-      el.textContent = data.lines.join('\\n');
-      el.className = 'log-lines';
+    if (data.entries && data.entries.length) {
+      el.className = 'log-container';
+      el.innerHTML = data.entries.map(e => {
+        const tag = e.action === 'UPLOAD' ? 'upload' : e.action === 'DOWNLOAD' ? 'download' : 'delete';
+        const label = e.action === 'UPLOAD' ? '上传' : e.action === 'DOWNLOAD' ? '下载' : '删除';
+        return '<div class="log-row">' +
+          '<span class="log-time">' + escapeHtml(e.short_time) + '</span>' +
+          '<span class="log-tag ' + tag + '">' + label + '</span>' +
+          '<span class="log-ip">' + escapeHtml(e.ip) + '</span>' +
+          '<span class="log-file">' + escapeHtml(e.file) + '</span>' +
+          '</div>';
+      }).join('');
     } else {
       el.textContent = '暂无操作记录';
-      el.className = 'log-lines placeholder';
+      el.className = 'log-container placeholder';
     }
     document.getElementById('logInfo').textContent = '共 ' + data.total + ' 条记录';
     document.getElementById('logBadge').textContent = data.total;
@@ -1436,20 +1455,33 @@ def admin_verify():
 
 @app.route("/api/admin/logs", methods=["POST"])
 def admin_logs():
-    """返回操作日志内容(需管理员密码)。"""
+    """返回操作日志内容(需管理员密码,结构化格式)。"""
     if not _admin_ok():
         return jsonify({"error": "密码错误"}), 403
     if not LOG_FILE or not LOG_FILE.is_file():
-        return jsonify({"lines": [], "total": 0})
+        return jsonify({"entries": [], "total": 0})
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             raw = f.read()
     except OSError:
-        return jsonify({"lines": [], "total": 0})
-    lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
-    # 最近 500 行,按时间正序(最早在上)
-    lines = lines[-500:]
-    return jsonify({"lines": lines, "total": len(lines)})
+        return jsonify({"entries": [], "total": 0})
+    entries = []
+    for line in raw.strip().split("\n"):
+        if not line.strip():
+            continue
+        parts = line.strip().split("\t")
+        if len(parts) >= 4:
+            t = parts[0]  # "2026-07-06 14:30:00"
+            short_time = t.split(" ")[1] if " " in t else t  # "14:30:00"
+            entries.append({
+                "time": t,
+                "short_time": short_time,
+                "ip": parts[1],
+                "action": parts[2],
+                "file": parts[3],
+            })
+    entries = entries[-500:]
+    return jsonify({"entries": entries, "total": len(entries)})
 
 
 def get_lan_ip() -> str:
