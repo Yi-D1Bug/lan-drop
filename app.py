@@ -231,6 +231,9 @@ _log_lock = threading.Lock()
 # 局域网访问地址,在 main() 启动时设置,供 QR 码 API 使用
 _lan_url: Optional[str] = None
 
+# 管理员密码(仅 --admin CLI 设置,不持久化到配置文件)
+_admin_password: Optional[str] = None
+
 
 def _log_operation(action: str, filename: str, ip: str):
     """追加一行操作日志:时间\tIP\t动作\t文件名。"""
@@ -242,6 +245,26 @@ def _log_operation(action: str, filename: str, ip: str):
                 f.write(line)
     except OSError:
         pass
+
+
+def _get_admin_pw() -> str:
+    """从请求中提取管理员密码(支持 body / header / query)。"""
+    data = request.get_json(silent=True) or {}
+    pw = data.get("admin_password", "")
+    if pw:
+        return pw
+    pw = request.headers.get("X-Admin-Password", "")
+    if pw:
+        return pw
+    return request.args.get("admin_password", "")
+
+
+def _admin_ok() -> bool:
+    """未设密码时一律放行,设了密码则校验。"""
+    if not _admin_password:
+        return True
+    return _get_admin_pw() == _admin_password
+
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = None  # 不限制单次上传大小
@@ -474,6 +497,41 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .qr-copy { font-size: 18px; border: none; background: none; cursor: pointer;
              padding: 4px 6px; border-radius: 6px; flex-shrink: 0; line-height: 1; }
   .qr-copy:hover { background: #f3f4f6; }
+  .admin-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 2000;
+                   display: flex; align-items: center; justify-content: center; }
+  .admin-dialog { background: #fff; border-radius: 14px; padding: 24px;
+                  box-shadow: 0 12px 40px rgba(0,0,0,.18); min-width: 300px; max-width: 360px; }
+  .admin-dialog h3 { font-size: 16px; margin: 0 0 6px; }
+  .admin-dialog .sub { font-size: 12px; color: #9ca3af; margin-bottom: 14px; }
+  .admin-dialog input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px;
+                        padding: 9px 12px; font-size: 14px; font-family: inherit;
+                        margin-bottom: 12px; }
+  .admin-dialog input:focus { outline: none; border-color: #3b82f6; }
+  .admin-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .admin-actions button { border: none; border-radius: 8px; padding: 7px 18px;
+                          font-size: 13px; cursor: pointer; }
+  .admin-actions .btn-cancel { background: #f3f4f6; color: #6b7280; }
+  .admin-actions .btn-cancel:hover { background: #e5e7eb; }
+  .admin-actions .btn-ok { background: #3b82f6; color: #fff; }
+  .admin-actions .btn-ok:hover { background: #2563eb; }
+  .admin-error { font-size: 12px; color: #ef4444; margin-top: 6px; display: none; }
+  .log-panel { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+               padding: 14px 16px; margin-top: 14px; }
+  .log-panel summary { font-size: 15px; color: #374151; cursor: pointer; user-select: none; }
+  .log-panel summary:focus { outline: none; }
+  .log-toolbar { display: flex; align-items: center; gap: 8px; margin: 10px 0 8px; }
+  .log-info { font-size: 11px; color: #9ca3af; flex: 1; }
+  .log-toolbar button { font-size: 11px; border: 1px solid #e5e7eb; background: #fff;
+                        border-radius: 5px; padding: 4px 12px; cursor: pointer; color: #6b7280; }
+  .log-toolbar button:hover { background: #f3f4f6; }
+  .log-lines { background: #1e1e2e; color: #cdd6f4; padding: 12px 14px; border-radius: 8px;
+               font-size: 11px; line-height: 1.8; max-height: 320px; overflow: auto;
+               white-space: pre-wrap; word-break: break-all;
+               font-family: "Cascadia Code", "Fira Code", "Consolas", "Monaco", monospace; }
+  .log-lines.placeholder { color: #9ca3af; text-align: center; padding: 28px;
+                            background: #f9fafb; font-family: inherit; }
+  .log-badge { font-size: 10px; background: #ef4444; color: #fff; border-radius: 8px;
+               padding: 1px 7px; margin-left: 4px; }
 </style>
 </head>
 <body>
@@ -538,6 +596,26 @@ PLACEHOLDER_HTML = r"""<!doctype html>
       <span class="hint" id="restartHint" style="display:none">⚠ 目录/端口/地址修改后需重启生效</span>
     </div>
   </details>
+  <details class="log-panel" id="logPanel">
+    <summary>📋 操作日志 <span class="log-badge" id="logBadge" style="display:none"></span></summary>
+    <div class="log-toolbar">
+      <span class="log-info" id="logInfo">点击加载查看操作记录</span>
+      <button onclick="loadLogs()">加载日志</button>
+    </div>
+    <pre class="log-lines placeholder" id="logLines">点击"加载日志"查看（需管理员密码）</pre>
+  </details>
+</div>
+<div class="admin-overlay" id="adminOverlay" style="display:none">
+  <div class="admin-dialog">
+    <h3>🔒 管理员验证</h3>
+    <div class="sub">此操作需要管理员密码</div>
+    <input type="password" id="adminPwInput" placeholder="输入密码…" autocomplete="off" onkeydown="if(event.key==='Enter')verifyAdmin()">
+    <div class="admin-error" id="adminAuthError">密码错误</div>
+    <div class="admin-actions">
+      <button class="btn-cancel" onclick="closeAdminAuth()">取消</button>
+      <button class="btn-ok" onclick="verifyAdmin()">确认</button>
+    </div>
+  </div>
 </div>
 <script>
 const drop = document.getElementById('drop');
@@ -996,6 +1074,104 @@ async function saveConfig() {
 }
 
 loadConfig();
+
+// ---- 管理员验证与操作日志 ----
+let adminRequired = false;
+let adminVerified = false;
+let pendingAdminCallback = null;
+
+function showAdminAuth() {
+  document.getElementById('adminOverlay').style.display = 'flex';
+  document.getElementById('adminPwInput').value = '';
+  document.getElementById('adminAuthError').style.display = 'none';
+  document.getElementById('adminPwInput').focus();
+}
+
+function closeAdminAuth() {
+  document.getElementById('adminOverlay').style.display = 'none';
+  pendingAdminCallback = null;
+}
+
+async function verifyAdmin() {
+  const pw = document.getElementById('adminPwInput').value;
+  if (!pw) return;
+  const res = await fetch('/api/admin/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ admin_password: pw })
+  });
+  const data = await res.json();
+  if (data.valid) {
+    adminVerified = true;
+    sessionStorage.setItem('lan_admin_pw', pw);
+    closeAdminAuth();
+    if (pendingAdminCallback) { pendingAdminCallback(); pendingAdminCallback = null; }
+  } else {
+    document.getElementById('adminAuthError').style.display = '';
+  }
+}
+
+function requireAdmin(callback) {
+  if (!adminRequired || adminVerified) { callback(); return; }
+  pendingAdminCallback = callback;
+  showAdminAuth();
+}
+
+async function loadLogs() {
+  requireAdmin(async () => {
+    const pw = sessionStorage.getItem('lan_admin_pw') || '';
+    const res = await fetch('/api/admin/logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ admin_password: pw })
+    });
+    if (res.status === 403) {
+      document.getElementById('logLines').textContent = '密码错误';
+      document.getElementById('logLines').className = 'log-lines placeholder';
+      adminVerified = false;
+      sessionStorage.removeItem('lan_admin_pw');
+      return;
+    }
+    const data = await res.json();
+    const el = document.getElementById('logLines');
+    if (data.lines.length) {
+      el.textContent = data.lines.join('\\n');
+      el.className = 'log-lines';
+    } else {
+      el.textContent = '暂无操作记录';
+      el.className = 'log-lines placeholder';
+    }
+    document.getElementById('logInfo').textContent = '共 ' + data.total + ' 条记录';
+    document.getElementById('logBadge').textContent = data.total;
+    document.getElementById('logBadge').style.display = data.total ? '' : 'none';
+  });
+}
+
+// ---- 修改后的设置保存(需管理员) ----
+const _origSaveConfig = saveConfig;
+saveConfig = function() {
+  requireAdmin(_origSaveConfig);
+};
+
+// 启动时检查是否已设置管理员密码
+(async () => {
+  const res = await fetch('/api/config');
+  const cfg = await res.json();
+  adminRequired = cfg.admin_required;
+  if (adminRequired) {
+    const pw = sessionStorage.getItem('lan_admin_pw');
+    if (pw) {
+      const vr = await fetch('/api/admin/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ admin_password: pw })
+      });
+      const vd = await vr.json();
+      if (vd.valid) adminVerified = true;
+      else sessionStorage.removeItem('lan_admin_pw');
+    }
+  }
+})();
 </script>
 <div id="notify"></div>
 </body>
@@ -1186,11 +1362,14 @@ def get_config():
         "autostart_actual": _check_autostart(),  # 自启文件实际是否存在
         "version": __version__,
         "startup_dir": str(SHARE_DIR) if SHARE_DIR else "",
+        "admin_required": bool(_admin_password),
     })
 
 
 @app.route("/api/config", methods=["POST"])
 def update_config():
+    if not _admin_ok():
+        return jsonify({"error": "密码错误", "admin_required": True}), 403
     data = request.get_json(silent=True) or {}
     cfg = _load_config()
     changed = False
@@ -1246,6 +1425,33 @@ def qrcode_image():
         abort(404)
 
 
+@app.route("/api/admin/verify", methods=["POST"])
+def admin_verify():
+    """验证管理员密码,返回 {valid: true/false, admin_required: true/false}。"""
+    return jsonify({
+        "valid": _admin_ok(),
+        "admin_required": bool(_admin_password),
+    })
+
+
+@app.route("/api/admin/logs", methods=["POST"])
+def admin_logs():
+    """返回操作日志内容(需管理员密码)。"""
+    if not _admin_ok():
+        return jsonify({"error": "密码错误"}), 403
+    if not LOG_FILE or not LOG_FILE.is_file():
+        return jsonify({"lines": [], "total": 0})
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return jsonify({"lines": [], "total": 0})
+    lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
+    # 最近 500 行,按时间正序(最早在上)
+    lines = lines[-500:]
+    return jsonify({"lines": lines, "total": len(lines)})
+
+
 def get_lan_ip() -> str:
     """获取本机在局域网中的 IP。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1282,7 +1488,7 @@ def print_banner(ip: str, port: int):
 
 
 def main():
-    global SHARE_DIR, CHAT_FILE, LOG_FILE, _lan_url
+    global SHARE_DIR, CHAT_FILE, LOG_FILE, _lan_url, _admin_password
 
     # 1. 加载配置文件
     cfg = _load_config()
@@ -1292,6 +1498,7 @@ def main():
     parser.add_argument("--port", type=int, default=None, help="监听端口")
     parser.add_argument("--host", default=None, help="监听地址")
     parser.add_argument("--dir", default=None, help="共享目录")
+    parser.add_argument("--admin", default=None, help="管理员密码(不设则所有人可修改设置)")
     args = parser.parse_args()
 
     # 3. 优先级: CLI > 环境变量 > 配置文件 > 默认值
@@ -1320,6 +1527,7 @@ def main():
     # 8. 启动
     ip = get_lan_ip()
     _lan_url = f"http://{ip}:{port}"
+    _admin_password = args.admin
     print_banner(ip, port)
     app.run(host=host, port=port, threaded=True)
 
