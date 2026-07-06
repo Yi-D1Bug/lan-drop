@@ -29,7 +29,7 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 # 配置文件目录(平台相关,不依赖 SHARE_DIR)
 if platform.system() == "Windows":
@@ -120,6 +120,7 @@ def _load_config() -> dict:
         "share_dir": str(Path("shared").resolve()),
         "port": 9000,
         "host": "0.0.0.0",
+        "admin_password": "",
     }
     if _CONFIG_FILE.is_file():
         try:
@@ -260,9 +261,9 @@ def _get_admin_pw() -> str:
 
 
 def _admin_ok() -> bool:
-    """未设密码时一律放行,设了密码则校验。"""
+    """校验管理员密码是否正确。未设密码时一律拒绝。"""
     if not _admin_password:
-        return True
+        return False
     return _get_admin_pw() == _admin_password
 
 
@@ -601,6 +602,10 @@ PLACEHOLDER_HTML = r"""<!doctype html>
       <div class="row">
         <label>保存目录</label>
         <input type="text" id="shareDirInput" spellcheck="false">
+      </div>
+      <div class="row">
+        <label>管理密码</label>
+        <input type="password" id="adminPwSetting" placeholder="留空则不启用" autocomplete="off">
       </div>
       <button class="save-btn" onclick="saveConfig()">保存</button>
       <span class="hint" id="restartHint" style="display:none">⚠ 目录/端口/地址修改后需重启生效</span>
@@ -1067,6 +1072,10 @@ async function saveConfig() {
   const body = { autostart: autoStartToggle.checked };
   const dir = shareDirInput.value.trim();
   if (dir) body.share_dir = dir;
+  const curPw = sessionStorage.getItem('lan_admin_pw');
+  if (curPw) body.admin_password = curPw;
+  const newPw = document.getElementById('adminPwSetting').value.trim();
+  if (newPw) body.set_admin_password = newPw;
   try {
     const res = await fetch('/api/config', {
       method: 'POST',
@@ -1074,12 +1083,19 @@ async function saveConfig() {
       body: JSON.stringify(body)
     });
     const cfg = await res.json();
-    autoStartToggle.checked = cfg.autostart_actual;
+    if (cfg.autostart_actual !== autoStartToggle.checked) {
+      autoStartToggle.checked = cfg.autostart_actual;
+    }
     shareDirInput.value = cfg.share_dir || '';
     if (cfg.restart_required) {
       restartHint.style.display = '';
       setTimeout(() => restartHint.style.display = 'none', 6000);
     }
+    document.getElementById('adminPwSetting').value = '';
+    // Re-check admin status after password change
+    const checkRes = await fetch('/api/config');
+    const checkCfg = await checkRes.json();
+    adminRequired = checkCfg.admin_required;
   } catch {}
 }
 
@@ -1127,8 +1143,22 @@ function requireAdmin(callback) {
   showAdminAuth();
 }
 
+// 设置面板点击保护:有管理员密码时需验证才能展开
+document.querySelector('#settingsPanel summary').addEventListener('click', function(e) {
+  if (adminRequired && !adminVerified && !document.getElementById('settingsPanel').open) {
+    e.preventDefault();
+    pendingAdminCallback = () => { document.getElementById('settingsPanel').open = true; };
+    showAdminAuth();
+  }
+});
+
 async function loadLogs() {
-  requireAdmin(async () => {
+  if (!adminVerified) {
+    pendingAdminCallback = () => loadLogs();
+    showAdminAuth();
+    return;
+  }
+  (async () => {
     const pw = sessionStorage.getItem('lan_admin_pw') || '';
     const res = await fetch('/api/admin/logs', {
       method: 'POST',
@@ -1163,7 +1193,7 @@ async function loadLogs() {
     document.getElementById('logInfo').textContent = '共 ' + data.total + ' 条记录';
     document.getElementById('logBadge').textContent = data.total;
     document.getElementById('logBadge').style.display = data.total ? '' : 'none';
-  });
+  })();
 }
 
 // ---- 修改后的设置保存(需管理员) ----
@@ -1376,8 +1406,9 @@ def message_stream():
 @app.route("/api/config")
 def get_config():
     cfg = _load_config()
+    safe = {k: v for k, v in cfg.items() if k != "admin_password"}
     return jsonify({
-        **cfg,
+        **safe,
         "autostart_actual": _check_autostart(),  # 自启文件实际是否存在
         "version": __version__,
         "startup_dir": str(SHARE_DIR) if SHARE_DIR else "",
@@ -1387,7 +1418,8 @@ def get_config():
 
 @app.route("/api/config", methods=["POST"])
 def update_config():
-    if not _admin_ok():
+    # 设了管理员密码才校验,没设则允许(保持零配置体验)
+    if _admin_password and not _admin_ok():
         return jsonify({"error": "密码错误", "admin_required": True}), 403
     data = request.get_json(silent=True) or {}
     cfg = _load_config()
@@ -1414,11 +1446,16 @@ def update_config():
         cfg["host"] = data["host"].strip() or "0.0.0.0"
         changed = True
 
+    if "set_admin_password" in data:
+        cfg["admin_password"] = data["set_admin_password"].strip()
+        changed = True
+
     if changed:
         _save_config(cfg)
 
+    safe_cfg = {k: v for k, v in cfg.items() if k != "admin_password"}
     return jsonify({
-        **cfg,
+        **safe_cfg,
         "autostart_actual": _check_autostart(),
         "restart_required": any(k in data for k in ("share_dir", "port", "host")),
     })
@@ -1446,10 +1483,11 @@ def qrcode_image():
 
 @app.route("/api/admin/verify", methods=["POST"])
 def admin_verify():
-    """验证管理员密码,返回 {valid: true/false, admin_required: true/false}。"""
+    """验证管理员密码。"""
     return jsonify({
         "valid": _admin_ok(),
         "admin_required": bool(_admin_password),
+        "message": "" if _admin_password else "未设置管理员密码,请在设置面板中设置或使用 --admin 参数启动服务器",
     })
 
 
@@ -1559,7 +1597,7 @@ def main():
     # 8. 启动
     ip = get_lan_ip()
     _lan_url = f"http://{ip}:{port}"
-    _admin_password = args.admin
+    _admin_password = args.admin or cfg.get("admin_password") or None
     print_banner(ip, port)
     app.run(host=host, port=port, threaded=True)
 
