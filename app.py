@@ -28,7 +28,7 @@ from flask import (
     stream_with_context,
 )
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 # 配置文件目录(平台相关,不依赖 SHARE_DIR)
 if platform.system() == "Windows":
@@ -435,6 +435,20 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   .row.highlight { animation: highlight 1s ease; }
   @keyframes highlight { 0%, 100% { background: transparent; }
                          50% { background: #fef3c7; } }
+  .sel-bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+             background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px;
+             margin-bottom: 10px; font-size: 13px; }
+  .sel-bar .sel-cb { width: 15px; height: 15px; cursor: pointer; accent-color: #3b82f6;
+                     margin: 0 2px; }
+  .sel-count { color: #3b82f6; font-weight: 500; margin: 0 6px; }
+  .sel-bar button { border: none; background: none; cursor: pointer; font-size: 13px;
+                    padding: 5px 12px; border-radius: 6px; }
+  .sel-bar .sel-clear { color: #6b7280; margin-left: auto; }
+  .sel-bar .sel-clear:hover { background: #e5e7eb; }
+  .sel-bar .sel-del { color: #fff; background: #ef4444; }
+  .sel-bar .sel-del:hover { background: #dc2626; }
+  .row .row-cb { width: 16px; height: 16px; cursor: pointer; accent-color: #3b82f6;
+                 flex-shrink: 0; margin-right: 2px; }
 </style>
 </head>
 <body>
@@ -450,6 +464,12 @@ PLACEHOLDER_HTML = r"""<!doctype html>
   <div class="search-box">
     <span class="search-icon">🔍</span>
     <input type="text" id="searchInput" placeholder="搜索文件..." spellcheck="false">
+  </div>
+  <div class="sel-bar" id="selBar" style="display:none">
+    <input type="checkbox" class="sel-cb" id="selectAllCb" onchange="toggleSelectAll(this)" title="全选/取消全选">
+    <span class="sel-count" id="selCount">已选 0 个</span>
+    <button class="sel-clear" onclick="clearSelection()">取消选择</button>
+    <button class="sel-del" onclick="batchDelete()">批量删除</button>
   </div>
   <div class="list" id="list"><div class="empty">加载中…</div></div>
 
@@ -609,6 +629,7 @@ function getCat(filename) {
 }
 
 let allFiles = [];
+let selectedFiles = new Set();
 
 async function loadFiles() {
   const res = await fetch('/api/files');
@@ -617,8 +638,13 @@ async function loadFiles() {
 }
 
 function renderFiles(files, searchQuery = '') {
+  // 清理已不在列表中的选中项
+  const currentNames = new Set(allFiles.map(f => f.name));
+  for (const n of selectedFiles) { if (!currentNames.has(n)) selectedFiles.delete(n); }
+
   if (!files.length) {
     list.innerHTML = '<div class="empty">暂无文件,上传一个试试</div>';
+    updateSelBar();
     return;
   }
 
@@ -628,16 +654,19 @@ function renderFiles(files, searchQuery = '') {
     files = files.filter(f => f.name.toLowerCase().includes(q));
     if (!files.length) {
       list.innerHTML = '<div class="empty">未找到匹配文件</div>';
+      updateSelBar();
       return;
     }
     // 搜索模式：平铺显示，不分组
     list.innerHTML = files.map(f => `
       <div class="row">
+        <input type="checkbox" class="row-cb" data-name="${escapeHtml(f.name)}" ${selectedFiles.has(f.name) ? 'checked' : ''} onchange="toggleSelect(this)">
         <span class="name">${escapeHtml(f.name)}</span>
         <span class="meta">${f.size_h} · ${f.mtime}</span>
         <a href="/download/${encodeURIComponent(f.name)}">下载</a>
         <button class="del" onclick="del('${encodeURIComponent(f.name)}')">删除</button>
       </div>`).join('');
+    updateSelBar();
     return;
   }
 
@@ -663,6 +692,7 @@ function renderFiles(files, searchQuery = '') {
     html += `<div class="cat-body" style="${collapsed ? 'display:none' : ''}">`;
     html += items.map(f => `
       <div class="row">
+        <input type="checkbox" class="row-cb" data-name="${escapeHtml(f.name)}" ${selectedFiles.has(f.name) ? 'checked' : ''} onchange="toggleSelect(this)">
         <span class="name">${escapeHtml(f.name)}</span>
         <span class="meta">${f.size_h} · ${f.mtime}</span>
         <a href="/download/${encodeURIComponent(f.name)}">下载</a>
@@ -671,6 +701,7 @@ function renderFiles(files, searchQuery = '') {
     html += '</div>';
   }
   list.innerHTML = html;
+  updateSelBar();
 }
 
 function toggleCat(el) {
@@ -681,6 +712,61 @@ function toggleCat(el) {
   body.style.display = collapsed ? '' : 'none';
   chevron.classList.toggle('open', collapsed);
   localStorage.setItem('lan_cat_' + cat, collapsed ? '0' : '1');
+}
+
+// ---- 多选 / 批量删除 ----
+function toggleSelect(cb) {
+  const name = cb.dataset.name;
+  if (cb.checked) selectedFiles.add(name);
+  else selectedFiles.delete(name);
+  updateSelBar();
+}
+
+function toggleSelectAll(masterCb) {
+  if (masterCb.checked) {
+    allFiles.forEach(f => selectedFiles.add(f.name));
+  } else {
+    selectedFiles.clear();
+  }
+  // 同步所有行内复选框
+  list.querySelectorAll('.row-cb').forEach(cb => { cb.checked = masterCb.checked; });
+  updateSelBar();
+}
+
+function clearSelection() {
+  selectedFiles.clear();
+  list.querySelectorAll('.row-cb').forEach(cb => { cb.checked = false; });
+  updateSelBar();
+}
+
+async function batchDelete() {
+  const count = selectedFiles.size;
+  if (!count) return;
+  if (!confirm(`确定删除选中的 ${count} 个文件?`)) return;
+  const res = await fetch('/api/files/batch-delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ files: [...selectedFiles] })
+  });
+  const data = await res.json();
+  // 清除已删除文件的选择状态,刷新列表
+  if (data.deleted) data.deleted.forEach(n => selectedFiles.delete(n));
+  loadFiles();
+}
+
+function updateSelBar() {
+  const bar = document.getElementById('selBar');
+  const count = selectedFiles.size;
+  const total = allFiles.length;
+  if (count > 0) {
+    bar.style.display = 'flex';
+    document.getElementById('selCount').textContent = `已选 ${count} 个`;
+    const master = document.getElementById('selectAllCb');
+    master.checked = (count === total);
+    master.indeterminate = (count > 0 && count < total);
+  } else {
+    bar.style.display = 'none';
+  }
 }
 
 async function del(name) {
@@ -931,6 +1017,29 @@ def delete(filename):
     target.unlink()
     _log_operation("DELETE", target.name, ip)
     return jsonify({"deleted": target.name})
+
+
+@app.route("/api/files/batch-delete", methods=["POST"])
+def batch_delete():
+    """批量删除文件。一次请求删除多个,速率限制按一次计算。"""
+    ip = request.remote_addr or "?"
+    if not _delete_limiter.check(ip):
+        return jsonify({"error": "请求过于频繁,请稍后再试"}), 429
+    data = request.get_json(silent=True) or {}
+    names = data.get("files", [])
+    if not names or not isinstance(names, list):
+        return jsonify({"error": "没有文件"}), 400
+    deleted = []
+    for name in names:
+        try:
+            target = safe_target(name)
+            if target.is_file():
+                target.unlink()
+                deleted.append(target.name)
+                _log_operation("DELETE", target.name, ip)
+        except Exception:
+            pass  # 跳过已被他人删除或非法文件名的
+    return jsonify({"deleted": deleted})
 
 
 @app.route("/api/messages")
